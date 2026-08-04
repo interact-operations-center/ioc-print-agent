@@ -1,0 +1,5 @@
+{
+    "serverUrl": "https://ioc.example.com",
+    "tokens": ["<agent token copied from the printer's edit page>"],
+    "pollIntervalSeconds": 2
+}
