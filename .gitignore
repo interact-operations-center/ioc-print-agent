@@ -1,0 +1,9 @@
+# contains printer secrets
+/config.json
+.python-version
+
+# pyinstaller build output (pyinstaller --distpath output/dist --workpath output/build --specpath output agent.py)
+/output/
+
+__pycache__/
+.venv/
