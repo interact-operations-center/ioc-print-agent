@@ -37,30 +37,39 @@ A printer added with a TCP/IP address works like a USB one: the spooler forwards
 
 ### Install (per user, no admin rights)
 
-Double-click `IOC Print Agent.exe`. It:
+Download `IOC-Print-Agent.exe` from the [latest release](https://github.com/interact-operations-center/ioc-print-agent/releases/latest) and double-click it. It:
 
 1. copies itself to `%LOCALAPPDATA%\Programs\IOC Print Agent\`;
 2. adds itself to the user's startup programs (`HKCU\…\Run`);
 3. starts in the background (no window) and shows a confirmation.
 
-Running it again updates the installed copy. A second instance exits at once (port already in use).
+Running a newer download updates the installed copy (quit the running one first: Task Manager → IOC Print Agent). A second instance exits at once (port already in use).
 
 - Logs: `%LOCALAPPDATA%\IOC Print Agent\agent.log`
-- Uninstall: `"IOC Print Agent.exe" --uninstall`, then delete the install folder.
-- Debug without installing: `python bridge.py`, or `"IOC Print Agent.exe" --foreground`.
+- Uninstall: `"%LOCALAPPDATA%\Programs\IOC Print Agent\IOC Print Agent.exe" --uninstall`, then delete the install folder.
+- Debug without installing: `python bridge.py`, or `IOC-Print-Agent.exe --foreground`.
 
 It runs in the user session on purpose (not as a Windows service): services run in session 0 and do not see the user's printer connections.
 
-### Build
+### Release
 
-On Windows:
+The `.github/workflows/release.yml` workflow builds the .exe on a Windows runner, starts it to check that `/status` and `/printers` answer, and attaches it to a GitHub Release. To publish a version:
+
+```bash
+# bump VERSION in bridge.py, commit, then:
+git tag v2.0.0 && git push origin v2.0.0
+```
+
+The workflow refuses a tag that doesn't match `VERSION`. A manual run (Actions → Release → Run workflow) only keeps the .exe as a workflow artifact.
+
+Stable download link for the latest version: `https://github.com/interact-operations-center/ioc-print-agent/releases/latest/download/IOC-Print-Agent.exe` (repo is private: it needs a GitHub account with access).
+
+Local build, on Windows:
 
 ```bash
 pip install -r requirements.txt pyinstaller
-pyinstaller --onefile --noconsole --name "IOC Print Agent" --distpath output/dist --workpath output/build --specpath output bridge.py
+pyinstaller --onefile --noconsole --name IOC-Print-Agent --distpath output/dist --workpath output/build --specpath output bridge.py
 ```
-
-Host `output/dist/IOC Print Agent.exe` where IOC links to it (`NEXT_PUBLIC_PRINT_AGENT_DOWNLOAD_URL`).
 
 ## Queue agent (`agent.py`)
 

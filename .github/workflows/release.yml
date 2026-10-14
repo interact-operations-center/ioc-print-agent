@@ -1,0 +1,70 @@
+# Builds "IOC Print Agent" (bridge.py) on Windows and attaches the .exe to a GitHub Release.
+#
+# Release: bump VERSION in bridge.py, commit, then push a matching tag:
+#     git tag v2.0.0 && git push origin v2.0.0
+# Manual run (Actions tab → Release → Run workflow): builds and keeps the .exe as a workflow artifact only.
+
+name: Release
+
+on:
+    push:
+        tags: ["v*"]
+    workflow_dispatch:
+
+permissions:
+    contents: write
+
+jobs:
+    build:
+        runs-on: windows-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+                  cache: pip
+
+            - name: Check tag matches VERSION
+              if: startsWith(github.ref, 'refs/tags/')
+              shell: pwsh
+              run: |
+                  $version = (Select-String -Path bridge.py -Pattern '^VERSION = "(.+)"').Matches[0].Groups[1].Value
+                  if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match VERSION $version in bridge.py" }
+
+            - name: Install dependencies
+              run: pip install -r requirements.txt pyinstaller
+
+            - name: Build
+              run: pyinstaller --onefile --noconsole --name IOC-Print-Agent --distpath output/dist --workpath output/build --specpath output bridge.py
+
+            # Starts the built .exe and checks its API answers: catches missing bundled modules (pywin32, pypdfium2).
+            - name: Smoke test
+              shell: pwsh
+              run: |
+                  $proc = Start-Process -FilePath "output/dist/IOC-Print-Agent.exe" -ArgumentList "--foreground" -PassThru
+                  try {
+                      $status = $null
+                      for ($i = 0; $i -lt 30 -and -not $status; $i++) {
+                          Start-Sleep -Seconds 1
+                          try { $status = Invoke-RestMethod -Uri "http://127.0.0.1:17531/status" } catch {}
+                      }
+                      if (-not $status) { throw "The app did not answer on /status" }
+                      Write-Host "status: $($status | ConvertTo-Json -Compress)"
+                      $printers = Invoke-RestMethod -Uri "http://127.0.0.1:17531/printers" -Headers @{ Origin = "https://ioc-demo.mstools.ch" }
+                      Write-Host "printers: $($printers | ConvertTo-Json -Compress)"
+                  } finally {
+                      Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                  }
+
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: IOC-Print-Agent
+                  path: output/dist/IOC-Print-Agent.exe
+
+            - name: Publish release
+              if: startsWith(github.ref, 'refs/tags/')
+              uses: softprops/action-gh-release@v2
+              with:
+                  files: output/dist/IOC-Print-Agent.exe
+                  generate_release_notes: true
