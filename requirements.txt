@@ -1,1 +1,6 @@
 requests>=2.31
+
+# bridge.py (Windows app)
+pypdfium2>=4.30
+pillow>=10.0
+pywin32>=306; sys_platform == "win32"
