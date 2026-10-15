@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "IOC Print Agent"
 APP_ID = "ioc-print-agent"
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("IOC_PRINT_AGENT_PORT", "17531"))
@@ -155,6 +155,11 @@ ESC_POS_MAX_WIDTH_DOTS = int(os.environ.get("IOC_ESCPOS_WIDTH_DOTS", "576"))
 # Rows per GS v 0 block: small blocks keep each command well inside the printers' buffer.
 ESC_POS_BAND_ROWS = 256
 RAW_DRIVERS = ("generic / text only",)
+# IOC's label PDF has a fixed height (sized for a long comment) that only page-based drivers need.
+# On a continuous roll, any blank band taller than this is shrunk to ESC_POS_KEEP_BLANK_DOTS,
+# so the label fits its content. The label's own spacings (QR margins, separators) stay below it.
+ESC_POS_MAX_BLANK_DOTS = int(os.environ.get("IOC_ESCPOS_MAX_BLANK_DOTS", "40"))
+ESC_POS_KEEP_BLANK_DOTS = 24  # 3 mm at 203 dpi
 
 
 def escpos_raster(image) -> bytes:
@@ -175,12 +180,44 @@ def escpos_raster(image) -> bytes:
     return bytes(out)
 
 
+def collapse_blank_bands(image, max_blank: int = ESC_POS_MAX_BLANK_DOTS, keep: int = ESC_POS_KEEP_BLANK_DOTS):
+    """Shrinks every run of fully white rows taller than max_blank to `keep` rows (0 = disabled)."""
+    if max_blank <= 0:
+        return image
+
+    from PIL import Image
+
+    width = image.width
+    data = image.tobytes()
+    blank = [b"\x00" not in data[y * width : (y + 1) * width] for y in range(image.height)]
+
+    rows: list[int] = []
+    y = 0
+    while y < image.height:
+        if not blank[y]:
+            rows.append(y)
+            y += 1
+            continue
+        end = y
+        while end < image.height and blank[end]:
+            end += 1
+        rows.extend(range(y, y + (keep if end - y > max_blank else end - y)))
+        y = end
+
+    if len(rows) == image.height:
+        return image
+    out = Image.new("L", (width, len(rows)), 255)
+    for i, src in enumerate(rows):
+        out.paste(image.crop((0, src, width, src + 1)), (0, i))
+    return out
+
+
 def escpos_document(pdf_bytes: bytes) -> tuple[bytes, int]:
     out = bytearray(b"\x1b@")  # ESC @: reset
     pages = 0
     for image in render_pages(pdf_bytes, ESC_POS_DPI, ESC_POS_MAX_WIDTH_DOTS):
         out += b"\x1ba\x01"  # ESC a 1: center (pages narrower than the roll)
-        out += escpos_raster(image)
+        out += escpos_raster(collapse_blank_bands(image))
         out += b"\x1dVB\x00"  # GS V 66 0: feed to the cutter, partial cut
         pages += 1
     return bytes(out), pages

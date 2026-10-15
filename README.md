@@ -23,7 +23,7 @@ The browser side lives in the IOC repo: `components/flows/label/printer-display.
 
 Each PDF page is rendered in pure black and white (the label PDF is laid out in 203-dpi dots, so it is 1:1 on an Epson TM) and sent through the Windows spooler, one job at a time, in one of two ways depending on the printer's driver:
 
-- **Generic / Text Only** (a TM printer added by IP without the Epson driver): this driver drops graphics, so the label goes as **raw ESC/POS** — `GS v 0` raster at 203 dpi, centered, then feed + partial cut (`GS V 66 0`). Pages wider than 576 dots (80 mm roll) are shrunk; set `IOC_ESCPOS_WIDTH_DOTS` (e.g. `384` for a 58 mm roll) to change it.
+- **Generic / Text Only** (a TM printer added by IP without the Epson driver): this driver drops graphics, so the label goes as **raw ESC/POS** — `GS v 0` raster at 203 dpi, centered, then feed + partial cut (`GS V 66 0`). Pages wider than 576 dots (80 mm roll) are shrunk; set `IOC_ESCPOS_WIDTH_DOTS` (e.g. `384` for a 58 mm roll) to change it. IOC's label PDF has a fixed height (room for a long comment); on the roll, every blank band taller than 40 dots (5 mm) is shrunk to 3 mm so the label fits its content — `IOC_ESCPOS_MAX_BLANK_DOTS=0` disables it.
 - **Any other driver** (Epson APD, PDF printer…): drawn through the driver (GDI) at its resolution, fitted in its printable area.
 
 The log line `printed … (n page(s), escpos|gdi)` tells which one was used.
