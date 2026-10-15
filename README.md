@@ -1,14 +1,6 @@
 # IOC Print Agent
 
-Local apps that print labels for [IOC](https://github.com/interact-operations-center/ioc). Two modes, matching the two print modes of IOC:
-
-| | `bridge.py` — Windows app (PC printers) | `agent.py` — queue agent (kiosks, ePOS printers) |
-|---|---|---|
-| Who prints | The IOC page in the browser of this PC | The IOC server, through a queue |
-| Printers | Any Windows printer of the PC (USB or TCP/IP port) | Epson ePOS printers reachable over HTTP(S) |
-| Configuration | None | `config.json` with the server URL and one token per printer |
-
-## Windows app (`bridge.py`)
+Local Windows app (`bridge.py`) that prints labels for [IOC](https://github.com/interact-operations-center/ioc) on the PC's Windows printers (USB or TCP/IP port).
 
 The IOC print popup ("This PC" section) talks to this app on `http://127.0.0.1:17531`. The browser is already signed in to IOC, so the app needs no token and no server URL.
 
@@ -36,11 +28,11 @@ Security:
 
 When IOC gets a new domain (production), add it to `DEFAULT_ALLOWED_ORIGINS` and rebuild.
 
-### Printer setup on the PC
+## Printer setup on the PC
 
 A printer added with a TCP/IP address works like a USB one: the spooler forwards the job. Use a **Standard TCP/IP** port (RAW, 9100) with either the **Generic / Text Only** driver (no install needed, the app sends ESC/POS) or the Epson driver (APD / TM-M30). Avoid WSD/IPP ports with the "Microsoft IPP Class Driver". In the driver preferences, select the roll width that matches the paper (e.g. 80 mm). In IOC, the user picks the paper format once per printer (kept in the browser).
 
-### Install (per user, no admin rights)
+## Install (per user, no admin rights)
 
 Download `IOC-Print-Agent.exe` from the [latest release](https://github.com/interact-operations-center/ioc-print-agent/releases/latest) and double-click it. It:
 
@@ -56,13 +48,13 @@ Running a newer download updates the installed copy (quit the running one first:
 
 It runs in the user session on purpose (not as a Windows service): services run in session 0 and do not see the user's printer connections.
 
-### Release
+## Release
 
 The `.github/workflows/release.yml` workflow builds the .exe on a Windows runner, starts it to check that `/status` and `/printers` answer, and attaches it to a GitHub Release. To publish a version:
 
 ```bash
 # bump VERSION in bridge.py, commit, then:
-git tag v2.0.0 && git push origin v2.0.0
+git tag v2.1.1 && git push origin v2.1.1
 ```
 
 The workflow refuses a tag that doesn't match `VERSION`. A manual run (Actions → Release → Run workflow) only keeps the .exe as a workflow artifact.
@@ -74,41 +66,4 @@ Local build, on Windows:
 ```bash
 pip install -r requirements.txt pyinstaller
 pyinstaller --onefile --noconsole --name IOC-Print-Agent --distpath output/dist --workpath output/build --specpath output bridge.py
-```
-
-## Queue agent (`agent.py`)
-
-The IOC server cannot reach the ePOS printers directly (they sit on isolated local networks), so it queues `PrintJob`s instead. This agent runs on a machine on the printers' network and loops:
-
-1. `GET {serverUrl}/api/printer/agent/poll` with `Authorization: Bearer <token>` → `{ jobs: [{ id, targetUrl, contentType, body }] }`
-2. `POST` each job's `body` to its `targetUrl` (the printer's ePOS endpoint)
-3. `POST {serverUrl}/api/printer/agent/result` with `{ jobId, ok, error }`
-
-The server side of this protocol lives in the IOC repo (`app/api/printer/agent/`). Any change to the payload format must be made in both repos.
-
-### Setup
-
-```bash
-pip install -r requirements.txt
-cp config.example.json config.json
-```
-
-In `config.json`:
-
-- `serverUrl` — the IOC base URL
-- `tokens` — one agent token per printer this machine serves (copied from the printer's edit page in IOC; regenerating it there invalidates the old one)
-- `pollIntervalSeconds` — optional, defaults to 2
-
-`config.json` contains secrets and is git-ignored. Set `AGENT_CONFIG` to load it from another path.
-
-### Run
-
-```bash
-python agent.py
-```
-
-### Build a standalone executable
-
-```bash
-pyinstaller --distpath output/dist --workpath output/build --specpath output agent.py
 ```
