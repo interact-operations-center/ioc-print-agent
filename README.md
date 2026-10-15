@@ -21,7 +21,12 @@ POST /print?printer=<name>&title=<t> → body application/pdf (one page per labe
 
 The browser side lives in the IOC repo: `components/flows/label/printer-display.tsx` (`NEXT_PUBLIC_PRINT_AGENT_URL`) and the PDF route `app/api/printer/label-pdf`. Any change to this contract must be made in both repos.
 
-Each PDF page is rendered at the printer's resolution (the label PDF is laid out in 203-dpi dots, so it is 1:1 on an Epson TM), fitted in the printable area, converted to pure black and white and sent through the Windows spooler. One job prints at a time.
+Each PDF page is rendered in pure black and white (the label PDF is laid out in 203-dpi dots, so it is 1:1 on an Epson TM) and sent through the Windows spooler, one job at a time, in one of two ways depending on the printer's driver:
+
+- **Generic / Text Only** (a TM printer added by IP without the Epson driver): this driver drops graphics, so the label goes as **raw ESC/POS** — `GS v 0` raster at 203 dpi, centered, then feed + partial cut (`GS V 66 0`). Pages wider than 576 dots (80 mm roll) are shrunk; set `IOC_ESCPOS_WIDTH_DOTS` (e.g. `384` for a 58 mm roll) to change it.
+- **Any other driver** (Epson APD, PDF printer…): drawn through the driver (GDI) at its resolution, fitted in its printable area.
+
+The log line `printed … (n page(s), escpos|gdi)` tells which one was used.
 
 Security:
 
@@ -33,7 +38,7 @@ When IOC gets a new domain (production), add it to `DEFAULT_ALLOWED_ORIGINS` and
 
 ### Printer setup on the PC
 
-A printer added with a TCP/IP address works like a USB one: the spooler forwards the job. Use the Epson driver (APD / TM-M30) on a **Standard TCP/IP** port (RAW, 9100). Avoid WSD/IPP ports with the "Microsoft IPP Class Driver". In the driver preferences, select the roll width that matches the paper (e.g. 80 mm). In IOC, the user picks the paper format once per printer (kept in the browser).
+A printer added with a TCP/IP address works like a USB one: the spooler forwards the job. Use a **Standard TCP/IP** port (RAW, 9100) with either the **Generic / Text Only** driver (no install needed, the app sends ESC/POS) or the Epson driver (APD / TM-M30). Avoid WSD/IPP ports with the "Microsoft IPP Class Driver". In the driver preferences, select the roll width that matches the paper (e.g. 80 mm). In IOC, the user picks the paper format once per printer (kept in the browser).
 
 ### Install (per user, no admin rights)
 

@@ -17,7 +17,6 @@ starts with Windows (HKCU Run key, no admin rights) and runs in the background.
     "IOC Print Agent.exe" --foreground  runs from the current location without installing (debug)
 """
 
-import io
 import json
 import logging
 import os
@@ -31,7 +30,7 @@ from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "IOC Print Agent"
 APP_ID = "ioc-print-agent"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("IOC_PRINT_AGENT_PORT", "17531"))
@@ -115,8 +114,8 @@ def list_printers() -> list[dict]:
     return [{"name": name, "isDefault": name == default} for name in names]
 
 
-def render_pages(pdf_bytes: bytes, dpi: int, max_width: int, max_height: int):
-    """Renders each PDF page at the printer's resolution, fitted in its printable area, black & white."""
+def render_pages(pdf_bytes: bytes, dpi: int, max_width: int, max_height: int = 0):
+    """Renders each PDF page at `dpi`, shrunk to fit max_width x max_height (0 = no height limit), pure black & white ("L" mode, 0 or 255)."""
     import pypdfium2 as pdfium
 
     try:
@@ -133,7 +132,9 @@ def render_pages(pdf_bytes: bytes, dpi: int, max_width: int, max_height: int):
             finally:
                 page.close()
 
-            ratio = min(1.0, max_width / image.width, max_height / image.height) if max_height > 0 else min(1.0, max_width / image.width)
+            ratio = min(1.0, max_width / image.width)
+            if max_height > 0:
+                ratio = min(ratio, max_height / image.height)
             if ratio < 1.0:
                 image = image.resize((max(1, int(image.width * ratio)), max(1, int(image.height * ratio))))
 
@@ -142,54 +143,150 @@ def render_pages(pdf_bytes: bytes, dpi: int, max_width: int, max_height: int):
         pdf.close()
 
 
-def print_pdf(printer_name: str, pdf_bytes: bytes, title: str) -> int:
+# ── ESC/POS (RAW) ──
+#
+# "Generic / Text Only" (the usual driver for a TM printer added by IP without the Epson
+# driver) drops every graphic: a GDI print comes out empty. For those printers the label is
+# sent as raw ESC/POS instead, which the driver passes through untouched to port 9100.
+
+ESC_POS_DPI = 203
+# 80 mm roll on a TM-M30 / TM-T88 / TM-T20: 576 printable dots. Wider pages are shrunk.
+ESC_POS_MAX_WIDTH_DOTS = int(os.environ.get("IOC_ESCPOS_WIDTH_DOTS", "576"))
+# Rows per GS v 0 block: small blocks keep each command well inside the printers' buffer.
+ESC_POS_BAND_ROWS = 256
+RAW_DRIVERS = ("generic / text only",)
+
+
+def escpos_raster(image) -> bytes:
+    """GS v 0 raster image(s) of a black & white "L" image (0 = black), 1 bit per dot, MSB first."""
+    from PIL import Image
+
+    width_bytes = (image.width + 7) // 8
+    # ESC/POS bit 1 = printed dot: black pixels (0) become 1. Mode "1" packs rows MSB first,
+    # padded to a whole byte with 0 (= not printed).
+    bits = image.point(lambda p: 255 if p == 0 else 0).convert("1", dither=Image.Dither.NONE)
+    data = bits.tobytes("raw", "1")
+
+    out = bytearray()
+    for top in range(0, image.height, ESC_POS_BAND_ROWS):
+        rows = min(ESC_POS_BAND_ROWS, image.height - top)
+        out += b"\x1dv0\x00" + bytes((width_bytes & 0xFF, width_bytes >> 8, rows & 0xFF, rows >> 8))
+        out += data[top * width_bytes : (top + rows) * width_bytes]
+    return bytes(out)
+
+
+def escpos_document(pdf_bytes: bytes) -> tuple[bytes, int]:
+    out = bytearray(b"\x1b@")  # ESC @: reset
+    pages = 0
+    for image in render_pages(pdf_bytes, ESC_POS_DPI, ESC_POS_MAX_WIDTH_DOTS):
+        out += b"\x1ba\x01"  # ESC a 1: center (pages narrower than the roll)
+        out += escpos_raster(image)
+        out += b"\x1dVB\x00"  # GS V 66 0: feed to the cutter, partial cut
+        pages += 1
+    return bytes(out), pages
+
+
+def printer_driver(printer_name: str) -> str:
+    import win32print
+
+    handle = win32print.OpenPrinter(printer_name)
+    try:
+        return win32print.GetPrinter(handle, 2).get("pDriverName") or ""
+    finally:
+        win32print.ClosePrinter(handle)
+
+
+def print_raw_escpos(printer_name: str, pdf_bytes: bytes, title: str) -> int:
+    import win32print
+
+    data, pages = escpos_document(pdf_bytes)
+    if pages == 0:
+        raise PrintError("The PDF has no pages", 400)
+
+    try:
+        handle = win32print.OpenPrinter(printer_name)
+    except Exception as e:
+        raise PrintError(f"Cannot open printer {printer_name}: {e}", 502)
+
+    try:
+        win32print.StartDocPrinter(handle, 1, (title, None, "RAW"))
+        try:
+            win32print.StartPagePrinter(handle)
+            win32print.WritePrinter(handle, data)
+            win32print.EndPagePrinter(handle)
+        finally:
+            win32print.EndDocPrinter(handle)
+    except Exception as e:
+        raise PrintError(f"Print failed on {printer_name}: {e}", 502)
+    finally:
+        win32print.ClosePrinter(handle)
+
+    return pages
+
+
+# ── GDI (printer's own driver) ──
+
+
+def print_gdi(printer_name: str, pdf_bytes: bytes, title: str) -> int:
     import win32con
     import win32ui
     from PIL import ImageWin
 
+    dc = win32ui.CreateDC()
+    try:
+        dc.CreatePrinterDC(printer_name)
+    except Exception as e:
+        raise PrintError(f"Cannot open printer {printer_name}: {e}", 502)
+
+    pages = 0
+    started = False
+    try:
+        dpi = dc.GetDeviceCaps(win32con.LOGPIXELSX)
+        width = dc.GetDeviceCaps(win32con.HORZRES)
+        height = dc.GetDeviceCaps(win32con.VERTRES)
+
+        dc.StartDoc(title)
+        started = True
+        for image in render_pages(pdf_bytes, dpi, width, height):
+            dc.StartPage()
+            left = max(0, (width - image.width) // 2)
+            ImageWin.Dib(image).draw(dc.GetHandleOutput(), (left, 0, left + image.width, image.height))
+            dc.EndPage()
+            pages += 1
+        dc.EndDoc()
+        started = False
+    except PrintError:
+        raise
+    except Exception as e:
+        raise PrintError(f"Print failed on {printer_name}: {e}", 502)
+    finally:
+        if started:
+            try:
+                dc.AbortDoc()
+            except Exception:
+                pass
+        dc.DeleteDC()
+
+    if pages == 0:
+        raise PrintError("The PDF has no pages", 400)
+    return pages
+
+
+def print_pdf(printer_name: str, pdf_bytes: bytes, title: str) -> tuple[int, str]:
+    """Prints the PDF; returns (pages, mode) where mode is "escpos" or "gdi"."""
     known = {p["name"] for p in list_printers()}
     if printer_name not in known:
         raise PrintError(f"Printer not found on this PC: {printer_name}", 404)
 
+    try:
+        driver = printer_driver(printer_name)
+    except Exception as e:
+        raise PrintError(f"Cannot open printer {printer_name}: {e}", 502)
+
     with print_lock:
-        dc = win32ui.CreateDC()
-        try:
-            dc.CreatePrinterDC(printer_name)
-        except Exception as e:
-            raise PrintError(f"Cannot open printer {printer_name}: {e}", 502)
-
-        pages = 0
-        started = False
-        try:
-            dpi = dc.GetDeviceCaps(win32con.LOGPIXELSX)
-            width = dc.GetDeviceCaps(win32con.HORZRES)
-            height = dc.GetDeviceCaps(win32con.VERTRES)
-
-            dc.StartDoc(title)
-            started = True
-            for image in render_pages(pdf_bytes, dpi, width, height):
-                dc.StartPage()
-                left = max(0, (width - image.width) // 2)
-                ImageWin.Dib(image).draw(dc.GetHandleOutput(), (left, 0, left + image.width, image.height))
-                dc.EndPage()
-                pages += 1
-            dc.EndDoc()
-            started = False
-        except PrintError:
-            raise
-        except Exception as e:
-            raise PrintError(f"Print failed on {printer_name}: {e}", 502)
-        finally:
-            if started:
-                try:
-                    dc.AbortDoc()
-                except Exception:
-                    pass
-            dc.DeleteDC()
-
-        if pages == 0:
-            raise PrintError("The PDF has no pages", 400)
-        return pages
+        if driver.strip().lower() in RAW_DRIVERS:
+            return print_raw_escpos(printer_name, pdf_bytes, title), "escpos"
+        return print_gdi(printer_name, pdf_bytes, title), "gdi"
 
 
 # ─────────────────────────────────────────────
@@ -314,7 +411,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            pages = print_pdf(printer, pdf_bytes, title)
+            pages, mode = print_pdf(printer, pdf_bytes, title)
         except PrintError as e:
             log.error("print %r on %r failed: %s", title, printer, e)
             self._json(e.status, {"error": str(e)})
@@ -324,7 +421,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": f"Print failed: {e}"})
             return
 
-        log.info("printed %r on %r (%d page(s))", title, printer, pages)
+        log.info("printed %r on %r (%d page(s), %s)", title, printer, pages, mode)
         self._json(200, {"ok": True, "pages": pages})
 
 
