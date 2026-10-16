@@ -6,9 +6,10 @@ The IOC print popup ("This PC" section) talks to this app on `http://127.0.0.1:1
 
 ```
 GET  /status                         → { app, version }
-GET  /printers                       → { printers: [{ name, isDefault }] }
+GET  /printers                       → { printers: [{ name, isDefault, status: "ready" | "offline" | "error", statusMessage }] }
 POST /print?printer=<name>&title=<t> → body application/pdf (one page per label)
                                        200 { ok, pages } | 4xx/5xx { error }
+                                       503 printer offline / in error, 504 job not taken in time
 ```
 
 The browser side lives in the IOC repo: `components/flows/label/printer-display.tsx` (`NEXT_PUBLIC_PRINT_AGENT_URL`) and the PDF route `app/api/printer/label-pdf`. Any change to this contract must be made in both repos.
@@ -19,6 +20,8 @@ Each PDF page is rendered in pure black and white (the label PDF is laid out in 
 - **Any other driver** (Epson APD, PDF printer…): drawn through the driver (GDI) at its resolution, fitted in its printable area.
 
 The log line `printed … (n page(s), escpos|gdi)` tells which one was used.
+
+The Windows spooler accepts a job even when the printer is unplugged or offline (it just waits in the queue), so the app checks the printer's state before printing (503 if it is offline, paused, out of labels, cover open…) and then follows the job in the queue. A job that fails, or is still queued after `IOC_JOB_TIMEOUT_SECONDS` (default 10) plus `IOC_JOB_SECONDS_PER_PAGE` (default 2) per label, is deleted, so it can't print by surprise once the printer comes back, and the page gets the error (503 / 504).
 
 Security:
 

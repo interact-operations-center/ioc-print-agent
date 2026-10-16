@@ -181,7 +181,10 @@ JOB_STATUS_ERRORS = (
 JOB_STATUS_PRINTED = 0x00000080
 JOB_CONTROL_DELETE = 5
 # How long a job may stay in the queue before it is considered stuck (unplugged printer, etc.).
+# The job stays queued while the printer prints it (the spooler sends at the printer's pace), so a
+# batch gets JOB_SECONDS_PER_PAGE more per label: otherwise a long batch would be cancelled mid-print.
 JOB_TIMEOUT_SECONDS = float(os.environ.get("IOC_JOB_TIMEOUT_SECONDS", "10"))
+JOB_SECONDS_PER_PAGE = float(os.environ.get("IOC_JOB_SECONDS_PER_PAGE", "2"))
 JOB_POLL_SECONDS = 0.25
 
 
@@ -230,8 +233,8 @@ def _delete_job(handle, job_id: int) -> None:
         log.warning("could not delete job %d", job_id)
 
 
-def wait_for_job(printer_name: str, job_id: int | None) -> None:
-    """Follows the spooled job until it leaves the queue. On error/timeout, deletes it and raises PrintError."""
+def wait_for_job(printer_name: str, job_id: int | None, pages: int) -> None:
+    """Follows the spooled job of `pages` pages until it leaves the queue. On error/timeout, deletes it and raises PrintError."""
     import win32print
 
     if not job_id or job_id <= 0:
@@ -243,7 +246,8 @@ def wait_for_job(printer_name: str, job_id: int | None) -> None:
         raise PrintError(f"Cannot open printer {printer_name}: {e}", 502)
 
     try:
-        deadline = time.monotonic() + JOB_TIMEOUT_SECONDS
+        timeout = JOB_TIMEOUT_SECONDS + pages * JOB_SECONDS_PER_PAGE
+        deadline = time.monotonic() + timeout
         while True:
             try:
                 job = win32print.GetJob(handle, job_id, 1)
@@ -263,7 +267,7 @@ def wait_for_job(printer_name: str, job_id: int | None) -> None:
 
             if time.monotonic() >= deadline:
                 _delete_job(handle, job_id)
-                raise PrintError(f"{printer_name}: printer did not take the job within {JOB_TIMEOUT_SECONDS:g}s (disconnected?){suffix}, job cancelled", 504)
+                raise PrintError(f"{printer_name}: printer did not take the job within {timeout:g}s (disconnected?){suffix}, job cancelled", 504)
 
             time.sleep(JOB_POLL_SECONDS)
     finally:
@@ -376,7 +380,7 @@ def print_raw_escpos(printer_name: str, pdf_bytes: bytes, title: str) -> int:
     finally:
         win32print.ClosePrinter(handle)
 
-    wait_for_job(printer_name, job_id)
+    wait_for_job(printer_name, job_id, pages)
     return pages
 
 
@@ -385,6 +389,7 @@ def print_raw_escpos(printer_name: str, pdf_bytes: bytes, title: str) -> int:
 
 def print_gdi(printer_name: str, pdf_bytes: bytes, title: str) -> int:
     import win32con
+    import win32print
     import win32ui
     from PIL import ImageWin
 
@@ -402,7 +407,8 @@ def print_gdi(printer_name: str, pdf_bytes: bytes, title: str) -> int:
         width = dc.GetDeviceCaps(win32con.HORZRES)
         height = dc.GetDeviceCaps(win32con.VERTRES)
 
-        job_id = dc.StartDoc(title)  # spooler job id
+        # win32print.StartDoc on the DC's handle, not dc.StartDoc: PyCDC.StartDoc returns None, not the spooler job id.
+        job_id = win32print.StartDoc(dc.GetSafeHdc(), (title, None, None, 0))
         started = True
         for image in render_pages(pdf_bytes, dpi, width, height):
             dc.StartPage()
@@ -427,7 +433,7 @@ def print_gdi(printer_name: str, pdf_bytes: bytes, title: str) -> int:
     if pages == 0:
         raise PrintError("The PDF has no pages", 400)
 
-    wait_for_job(printer_name, job_id if isinstance(job_id, int) else None)
+    wait_for_job(printer_name, job_id, pages)
     return pages
 
 
