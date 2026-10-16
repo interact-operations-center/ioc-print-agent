@@ -4,9 +4,12 @@ Zero configuration: the IOC web page (already signed in) talks to this app over
 http://127.0.0.1:17531, so no token or server URL is needed here.
 
     GET  /status                         -> {"app": "ioc-print-agent", "version": "..."}
-    GET  /printers                       -> {"printers": [{"name": str, "isDefault": bool}]}
+    GET  /printers                       -> {"printers": [{"name": str, "isDefault": bool,
+                                                           "status": "ready" | "offline" | "error",
+                                                           "statusMessage": str | null}]}
     POST /print?printer=<name>&title=<t> -> body: application/pdf (one page per label)
                                             200 {"ok": true, "pages": n} | 4xx/5xx {"error": str}
+                                            503: printer offline / in error, 504: job not taken in time
 
 The browser side lives in the IOC repo (components/flows/label/printer-display.tsx,
 PDF from app/api/printer/label-pdf). Any change to this contract must be made in both repos.
@@ -24,13 +27,14 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "IOC Print Agent"
 APP_ID = "ioc-print-agent"
-VERSION = "2.1.1"
+VERSION = "2.2.0"
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("IOC_PRINT_AGENT_PORT", "17531"))
@@ -106,12 +110,18 @@ def list_printers() -> list[dict]:
     import win32print
 
     flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
-    names = sorted({p[2] for p in win32print.EnumPrinters(flags, None, 1)})
     try:
         default = win32print.GetDefaultPrinter()
     except Exception:
         default = None
-    return [{"name": name, "isDefault": name == default} for name in names]
+
+    # Level 2 carries Status/Attributes: the page can flag an offline printer before printing.
+    printers: dict[str, dict] = {}
+    for info in win32print.EnumPrinters(flags, None, 2):
+        name = info["pPrinterName"]
+        status, message = printer_state(info)
+        printers[name] = {"name": name, "isDefault": name == default, "status": status, "statusMessage": message}
+    return [printers[name] for name in sorted(printers)]
 
 
 def render_pages(pdf_bytes: bytes, dpi: int, max_width: int, max_height: int = 0):
@@ -141,6 +151,123 @@ def render_pages(pdf_bytes: bytes, dpi: int, max_width: int, max_height: int = 0
             yield image.point(lambda p: 255 if p > MONO_THRESHOLD else 0)
     finally:
         pdf.close()
+
+
+# ── Printer / job state ──
+#
+# The Windows spooler accepts a job even when the printer is unplugged or offline: StartDoc/EndDoc
+# succeed and the job just waits in the queue. So the printer state is checked before printing and
+# the job is followed in the queue afterwards. A job that fails or never leaves the queue is deleted
+# (otherwise it would print by surprise once the printer comes back) and reported as an error.
+
+PRINTER_ATTRIBUTE_WORK_OFFLINE = 0x00000400
+PRINTER_STATUS_ERRORS = (
+    (0x00000080, "printer is offline"),  # PRINTER_STATUS_OFFLINE
+    (0x00001000, "printer is not available"),  # PRINTER_STATUS_NOT_AVAILABLE
+    (0x00000002, "printer is in error"),  # PRINTER_STATUS_ERROR
+    (0x00000010, "printer is out of labels"),  # PRINTER_STATUS_PAPER_OUT
+    (0x00000008, "label jam"),  # PRINTER_STATUS_PAPER_JAM
+    (0x00400000, "printer cover is open"),  # PRINTER_STATUS_DOOR_OPEN
+    (0x00100000, "printer needs user intervention"),  # PRINTER_STATUS_USER_INTERVENTION
+    (0x00000001, "printer queue is paused"),  # PRINTER_STATUS_PAUSED
+)
+JOB_STATUS_ERRORS = (
+    (0x00000020, "printer is offline"),  # JOB_STATUS_OFFLINE
+    (0x00000002, "print job failed"),  # JOB_STATUS_ERROR
+    (0x00000040, "printer is out of labels"),  # JOB_STATUS_PAPEROUT
+    (0x00000200, "printer driver blocked the job"),  # JOB_STATUS_BLOCKED_DEVQ
+    (0x00000400, "printer needs user intervention"),  # JOB_STATUS_USER_INTERVENTION
+)
+JOB_STATUS_PRINTED = 0x00000080
+JOB_CONTROL_DELETE = 5
+# How long a job may stay in the queue before it is considered stuck (unplugged printer, etc.).
+JOB_TIMEOUT_SECONDS = float(os.environ.get("IOC_JOB_TIMEOUT_SECONDS", "10"))
+JOB_POLL_SECONDS = 0.25
+
+
+def printer_info(printer_name: str) -> dict:
+    import win32print
+
+    try:
+        handle = win32print.OpenPrinter(printer_name)
+    except Exception as e:
+        raise PrintError(f"Cannot open printer {printer_name}: {e}", 502)
+    try:
+        return win32print.GetPrinter(handle, 2)
+    except Exception as e:
+        raise PrintError(f"Cannot read printer {printer_name}: {e}", 502)
+    finally:
+        win32print.ClosePrinter(handle)
+
+
+# Status flags that mean "not reachable" rather than "reachable but needs attention".
+PRINTER_OFFLINE_FLAGS = frozenset({0x00000080, 0x00001000})
+
+
+def printer_state(info: dict) -> tuple[str, str | None]:
+    """("ready", None) | ("offline", message) | ("error", message), from a level 2 printer info (GetPrinter / EnumPrinters)."""
+    if (info.get("Attributes") or 0) & PRINTER_ATTRIBUTE_WORK_OFFLINE:
+        return "offline", "printer is offline (disconnected or set to 'Use printer offline')"
+    status = info.get("Status") or 0
+    for flag, message in PRINTER_STATUS_ERRORS:
+        if status & flag:
+            return ("offline" if flag in PRINTER_OFFLINE_FLAGS else "error"), message
+    return "ready", None
+
+
+def check_printer_ready(printer_name: str, info: dict) -> None:
+    status, message = printer_state(info)
+    if status != "ready":
+        raise PrintError(f"{printer_name}: {message}", 503)
+
+
+def _delete_job(handle, job_id: int) -> None:
+    import win32print
+
+    try:
+        win32print.SetJob(handle, job_id, 0, None, JOB_CONTROL_DELETE)
+    except Exception:
+        log.warning("could not delete job %d", job_id)
+
+
+def wait_for_job(printer_name: str, job_id: int | None) -> None:
+    """Follows the spooled job until it leaves the queue. On error/timeout, deletes it and raises PrintError."""
+    import win32print
+
+    if not job_id or job_id <= 0:
+        return
+
+    try:
+        handle = win32print.OpenPrinter(printer_name)
+    except Exception as e:
+        raise PrintError(f"Cannot open printer {printer_name}: {e}", 502)
+
+    try:
+        deadline = time.monotonic() + JOB_TIMEOUT_SECONDS
+        while True:
+            try:
+                job = win32print.GetJob(handle, job_id, 1)
+            except Exception:
+                return  # left the queue: handed over to the printer
+
+            status = job.get("Status") or 0
+            if status & JOB_STATUS_PRINTED:
+                return
+
+            driver_status = (job.get("pStatus") or "").strip()
+            suffix = f" ({driver_status})" if driver_status else ""
+            for flag, message in JOB_STATUS_ERRORS:
+                if status & flag:
+                    _delete_job(handle, job_id)
+                    raise PrintError(f"{printer_name}: {message}{suffix}, job cancelled", 503)
+
+            if time.monotonic() >= deadline:
+                _delete_job(handle, job_id)
+                raise PrintError(f"{printer_name}: printer did not take the job within {JOB_TIMEOUT_SECONDS:g}s (disconnected?){suffix}, job cancelled", 504)
+
+            time.sleep(JOB_POLL_SECONDS)
+    finally:
+        win32print.ClosePrinter(handle)
 
 
 # ── ESC/POS (RAW) ──
@@ -223,16 +350,6 @@ def escpos_document(pdf_bytes: bytes) -> tuple[bytes, int]:
     return bytes(out), pages
 
 
-def printer_driver(printer_name: str) -> str:
-    import win32print
-
-    handle = win32print.OpenPrinter(printer_name)
-    try:
-        return win32print.GetPrinter(handle, 2).get("pDriverName") or ""
-    finally:
-        win32print.ClosePrinter(handle)
-
-
 def print_raw_escpos(printer_name: str, pdf_bytes: bytes, title: str) -> int:
     import win32print
 
@@ -245,8 +362,9 @@ def print_raw_escpos(printer_name: str, pdf_bytes: bytes, title: str) -> int:
     except Exception as e:
         raise PrintError(f"Cannot open printer {printer_name}: {e}", 502)
 
+    job_id = None
     try:
-        win32print.StartDocPrinter(handle, 1, (title, None, "RAW"))
+        job_id = win32print.StartDocPrinter(handle, 1, (title, None, "RAW"))
         try:
             win32print.StartPagePrinter(handle)
             win32print.WritePrinter(handle, data)
@@ -258,6 +376,7 @@ def print_raw_escpos(printer_name: str, pdf_bytes: bytes, title: str) -> int:
     finally:
         win32print.ClosePrinter(handle)
 
+    wait_for_job(printer_name, job_id)
     return pages
 
 
@@ -276,13 +395,14 @@ def print_gdi(printer_name: str, pdf_bytes: bytes, title: str) -> int:
         raise PrintError(f"Cannot open printer {printer_name}: {e}", 502)
 
     pages = 0
+    job_id = None
     started = False
     try:
         dpi = dc.GetDeviceCaps(win32con.LOGPIXELSX)
         width = dc.GetDeviceCaps(win32con.HORZRES)
         height = dc.GetDeviceCaps(win32con.VERTRES)
 
-        dc.StartDoc(title)
+        job_id = dc.StartDoc(title)  # spooler job id
         started = True
         for image in render_pages(pdf_bytes, dpi, width, height):
             dc.StartPage()
@@ -306,6 +426,8 @@ def print_gdi(printer_name: str, pdf_bytes: bytes, title: str) -> int:
 
     if pages == 0:
         raise PrintError("The PDF has no pages", 400)
+
+    wait_for_job(printer_name, job_id if isinstance(job_id, int) else None)
     return pages
 
 
@@ -315,12 +437,12 @@ def print_pdf(printer_name: str, pdf_bytes: bytes, title: str) -> tuple[int, str
     if printer_name not in known:
         raise PrintError(f"Printer not found on this PC: {printer_name}", 404)
 
-    try:
-        driver = printer_driver(printer_name)
-    except Exception as e:
-        raise PrintError(f"Cannot open printer {printer_name}: {e}", 502)
-
     with print_lock:
+        # Read inside the lock: the state may have changed while waiting for a previous job.
+        info = printer_info(printer_name)
+        check_printer_ready(printer_name, info)
+
+        driver = info.get("pDriverName") or ""
         if driver.strip().lower() in RAW_DRIVERS:
             return print_raw_escpos(printer_name, pdf_bytes, title), "escpos"
         return print_gdi(printer_name, pdf_bytes, title), "gdi"
