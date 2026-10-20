@@ -15,7 +15,8 @@ The browser side lives in the IOC repo (components/flows/label/printer-display.t
 PDF from app/api/printer/label-pdf). Any change to this contract must be made in both repos.
 
 Run once (double-click the .exe): it copies itself to %LOCALAPPDATA%\\Programs\\IOC Print Agent,
-starts with Windows (HKCU Run key, no admin rights) and runs in the background.
+starts with Windows (HKCU Run key, no admin rights) and runs in the background, with an icon in
+the notification area (right-click: open the log, quit).
     "IOC Print Agent.exe" --uninstall   removes the autostart entry
     "IOC Print Agent.exe" --foreground  runs from the current location without installing (debug)
 """
@@ -34,7 +35,7 @@ from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "IOC Print Agent"
 APP_ID = "ioc-print-agent"
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("IOC_PRINT_AGENT_PORT", "17531"))
@@ -590,23 +591,95 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "pages": pages})
 
 
+# ─────────────────────────────────────────────
+# Tray icon (Windows notification area)
+# ─────────────────────────────────────────────
+
+
+def tray_image():
+    """64x64 icon drawn in code (no .ico to bundle): "IOC" on a dark rounded square."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    size = 64
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((1, 1, size - 2, size - 2), radius=12, fill=(31, 41, 55, 255))
+    try:
+        font = ImageFont.truetype("segoeuib.ttf", 26)  # Segoe UI Bold, in every Windows' fonts folder
+    except OSError:
+        font = ImageFont.load_default()
+    left, top, right, bottom = draw.textbbox((0, 0), "IOC", font=font)
+    draw.text(((size - (right - left)) / 2 - left, (size - (bottom - top)) / 2 - top), "IOC", font=font, fill=(255, 255, 255, 255))
+    return image
+
+
+def tray_icon(server: ThreadingHTTPServer):
+    """The notification-area icon, or None where there is none (not Windows, pystray not installed)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import pystray
+    except ImportError as e:
+        log.warning("no tray icon (pystray unavailable: %s)", e)
+        return None
+
+    def open_path(path: str):
+        def action(icon, item) -> None:
+            try:
+                os.startfile(path)
+            except OSError as e:
+                log.warning("cannot open %s: %s", path, e)
+
+        return action
+
+    def quit_app(icon, item) -> None:
+        log.info("quit requested from the tray icon")
+        # Waits for the job being printed. Never released: a request waiting for the lock must not
+        # start a job that the exit would cut.
+        print_lock.acquire()
+        server.shutdown()
+        server.server_close()
+        icon.stop()
+        log.info("stopped")
+
+    menu = pystray.Menu(
+        pystray.MenuItem(f"{APP_NAME} v{VERSION}", None, enabled=False),
+        pystray.MenuItem(f"Listening on {HOST}:{PORT}", None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Open log", open_path(LOG_PATH)),
+        pystray.MenuItem("Open log folder", open_path(DATA_DIR)),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quit", quit_app),
+    )
+    return pystray.Icon(APP_ID, tray_image(), f"{APP_NAME} {VERSION} — http://{HOST}:{PORT}", menu)
+
+
 def serve() -> None:
     setup_logging()
     try:
         server = ThreadingHTTPServer((HOST, PORT), Handler)
     except OSError as e:
-        # Already running (autostart + double-click): the other instance serves the site.
+        # Already running (autostart + double-click): the other instance serves the site (and shows the icon).
         log.warning("port %d unavailable, another instance is probably running: %s", PORT, e)
         return
     server.daemon_threads = True
     log.info("%s %s listening on http://%s:%d for %s", APP_NAME, VERSION, HOST, PORT, ", ".join(sorted(ALLOWED_ORIGINS)))
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        log.info("stopped")
+
+    icon = tray_icon(server)
+    if icon is None:
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
+            log.info("stopped")
+        return
+
+    # pystray needs the main thread on Windows, so the server answers from its own thread. It is
+    # listening before the icon shows up (the release smoke test calls /status meanwhile).
+    threading.Thread(target=server.serve_forever, name="http", daemon=True).start()
+    icon.run()
 
 
 # ─────────────────────────────────────────────
