@@ -43,11 +43,13 @@ Download `IOC-Print-Agent.exe` from the [latest release](https://github.com/inte
 2. adds itself to the user's startup programs (`HKCU\…\Run`);
 3. starts in the background (no window) and shows a confirmation.
 
-Running a newer download updates the installed copy (quit the running one first: Task Manager → IOC Print Agent). A second instance exits at once (port already in use).
+While it runs, an **IOC** icon sits in the notification area (next to the clock; it may be under the `^` overflow arrow). Hovering it shows the version and address; right-click gives **Open log**, **Open log folder** and **Quit**. Quit waits for a label being printed, then stops the app.
 
-- Logs: `%LOCALAPPDATA%\IOC Print Agent\agent.log`
+Running a newer download updates the installed copy (quit the running one first: right-click the IOC icon → Quit). A second instance exits at once (port already in use), without a second icon.
+
+- Logs: `%LOCALAPPDATA%\IOC Print Agent\agent.log` (or tray icon → Open log)
 - Uninstall: `"%LOCALAPPDATA%\Programs\IOC Print Agent\IOC Print Agent.exe" --uninstall`, then delete the install folder.
-- Debug without installing: `python bridge.py`, or `IOC-Print-Agent.exe --foreground`.
+- Debug without installing: `python bridge.py`, or `IOC-Print-Agent.exe --foreground` (both show the tray icon on Windows; elsewhere, or without pystray, `python bridge.py` runs without it until Ctrl+C).
 
 It runs in the user session on purpose (not as a Windows service): services run in session 0 and do not see the user's printer connections.
 
